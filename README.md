@@ -32,18 +32,11 @@ For example, if you're running Metabase from a directory called `/app/`, you sho
 ./plugins/doris.metabase-driver.jar
 ```
 
-If you're running Metabase from the Mac App, the plugins directory defaults to `~/Library/Application Support/Metabase/Plugins/`:
-
-```bash
-# example directory structure for running Metabase Mac App with Doris support
-/Users/camsaul/Library/Application Support/Metabase/Plugins/doris.metabase-driver.jar
-```
-
 ## Building the driver
 
 ## Prereq: Install the Clojure CLI
 
-Make sure you have the `clojure` CLI version `1.10.3.933` or newer installed; you can check this with `clojure
+Make sure you have the `clojure` CLI version `1.11.1.1435` or newer installed; you can check this with `clojure
 --version`. Follow the instructions at https://clojure.org/guides/getting_started if you need to install a
 newer version.
 
@@ -53,7 +46,7 @@ newer version.
 git clone https://github.com/metabase/metabase
 ```
 
-## Build it (Updated for build script changes in Metabase 0.46.0)
+## Build it (Updated for build script changes in Metabase 0.48.0)
 
 Unfortunately the current command for building a driver is quite a mouthful, but we needed to make changes to how the
 Metabase build script works to avoid issues with dependencies shadowing one another. Please upvote
