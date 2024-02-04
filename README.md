@@ -1,4 +1,4 @@
-# Metabase Impala Driver
+# Metabase Doris Driver
 
 The Metabase Doris driver allows Metabase v0.48.0 or above to connect to Doris databases.
 
@@ -6,7 +6,7 @@ The Metabase Doris driver allows Metabase v0.48.0 or above to connect to Doris d
 
 ### Downloading Doris Metabase Driver
 
-[Click here](https://github.com/ihadoop/metabase-doris-driver/releases) to view the latest release of the Metabase Impala driver; click the link to download `doris.metabase-driver.jar`.
+[Click here](https://github.com/ihadoop/metabase-doris-driver/releases) to view the latest release of the Metabase Doris driver; click the link to download `doris.metabase-driver.jar`.
 
 ### How to Install it
 
@@ -19,10 +19,10 @@ Follow steps shown bellow to install the driver properly:
 
 By default, the plugins directory is called `plugins`, and lives in the same directory as the Metabase JAR.
 
-For example, if you're running Metabase from a directory called `/app/`, you should move the Impala driver JAR to `/app/plugins/`:
+For example, if you're running Metabase from a directory called `/app/`, you should move the Doris driver JAR to `/app/plugins/`:
 
 ```bash
-# example directory structure for running Metabase with Impala support
+# example directory structure for running Metabase with Doris support
 ./metabase.jar
 ./plugins/doris.metabase-driver.jar
 ```
@@ -30,7 +30,7 @@ For example, if you're running Metabase from a directory called `/app/`, you sho
 If you're running Metabase from the Mac App, the plugins directory defaults to `~/Library/Application Support/Metabase/Plugins/`:
 
 ```bash
-# example directory structure for running Metabase Mac App with Impala support
+# example directory structure for running Metabase Mac App with Doris support
 /Users/camsaul/Library/Application Support/Metabase/Plugins/doris.metabase-driver.jar
 ```
 
