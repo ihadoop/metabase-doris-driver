@@ -1,0 +1,34 @@
+info:
+  name: Metabase Doris Driver
+  version: 0.0.1
+  description: Doris Driver
+driver:
+  name: doris
+  display-name: Doris
+  lazy-load: true
+  parent: sql-jdbc
+  connection-properties:
+   - host
+   - merge:
+      - port
+      - default: 9030
+   - name: dbname
+     display-name: Database name
+   - merge:
+      - user
+      - required: true
+        placeholder: "username"
+   - password
+   - ssl
+   - ssh-tunnel
+   - advanced-options-start
+   - merge:
+        - additional-options
+        - placeholder: "trustServerCertificate=false"
+   - default-advanced-options
+
+init:
+  - step: load-namespace
+    namespace: metabase.driver.doris
+  - step: register-jdbc-driver
+    class: com.mysql.cj.jdbc.Driver
