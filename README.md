@@ -1,6 +1,11 @@
 # Metabase Doris Driver
 
-The Metabase Doris driver allows Metabase v0.48.0 or above to connect to Doris databases.
+The Metabase Doris driver allows Metabase v0.48.0 or above to connect to Doris databases.If Metabase version below v0.48.0,try to use mysql driver  to connection with doris.
+
+## Function
+1. synch doris database tables infomation
+2. synch doris table fields infomation
+3. query sql with doris  
 
 ## Downloading and Installing Doris Driver
 
