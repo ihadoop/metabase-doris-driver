@@ -13,8 +13,6 @@
    [metabase.db.spec :as mdb.spec]
    [metabase.driver :as driver]
    [metabase.driver.common :as driver.common]
-   [metabase.driver.doris.actions :as doris.actions]
-   [metabase.driver.doris.ddl :as doris.ddl]
    [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
@@ -35,21 +33,15 @@
    [metabase.util.log :as log])
   (:import
    (java.io File)
-   (java.sql Connection DatabaseMetaData ResultSet ResultSetMetaData Types)
-   (java.time LocalDateTime OffsetDateTime OffsetTime ZonedDateTime ZoneOffset)
-   (java.time.format DateTimeFormatter)))
+   (java.sql Connection ResultSet ResultSetMetaData Types)
+   (java.time LocalDateTime OffsetDateTime OffsetTime ZonedDateTime)))
 
 (set! *warn-on-reflection* true)
 
-(comment
-  ;; method impls live in these namespaces.
-  doris.actions/keep-me
-  doris.ddl/keep-me)
+
 
 (driver/register! :doris, :parent :sql-jdbc)
 
-(def ^:private ^:const min-supported-doris-version 5.7)
-(def ^:private ^:const min-supported-mariadb-version 10.2)
 
 (defmethod driver/display-name :doris [_] "Doris")
 
@@ -63,75 +55,28 @@
                               :full-join                              false
                               :uploads                                false
                               :schemas                                false
-                              ;; doris LIKE clauses are case-sensitive or not based on whether the collation of the server and the columns
-                              ;; themselves. Since this isn't something we can really change in the query itself don't present the option to the
-                              ;; users in the UI
                               :case-sensitivity-string-filter-options false
                               :index-info                             false}]
   (defmethod driver/database-supports? [:doris feature] [_driver _feature _db] supported?))
 
-;; This is a bit of a lie since the JSON type was introduced for doris since 5.7.8.
-;; And MariaDB doesn't have the JSON type at all, though `JSON` was introduced as an alias for LONGTEXT in 10.2.7.
-;; But since JSON unfolding will only apply columns with JSON types, this won't cause any problems during sync.
+
 (defmethod driver/database-supports? [:doris :nested-field-columns] [_driver _feat db]
   (driver.common/json-unfolding-default db))
 
 (doseq [feature [:actions :actions/custom]]
   (defmethod driver/database-supports? [:doris feature]
     [driver _feat _db]
-    ;; Only supported for doris right now. Revise when a child driver is added.
+    ;; Only supported for doris right now.
     (= driver :doris)))
 
-(defn mariadb?
-  "Returns true if the database is MariaDB. Assumes the database has been synced so `:dbms_version` is present."
-  [database]
-  (-> database :dbms_version :flavor (= "MariaDB")))
 
 (defmethod driver/database-supports? [:doris :table-privileges]
   [driver _feat db]
-  (and (= driver :doris) (not (mariadb? db))))
+  ( = driver :doris))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             metabase.driver impls                                              |
 ;;; +----------------------------------------------------------------------------------------------------------------+
-
-(defn- db-version [^DatabaseMetaData metadata]
-  (Double/parseDouble
-   (format "%d.%d" (.getDatabaseMajorVersion metadata) (.getDatabaseMinorVersion metadata))))
-
-(defn- unsupported-version? [^DatabaseMetaData metadata]
-  (let [mariadb? (= (.getDatabaseProductName metadata) "MariaDB")]
-    (< (db-version metadata)
-       (if mariadb?
-         min-supported-mariadb-version
-         min-supported-doris-version))))
-
-(defn- warn-on-unsupported-versions [driver details]
-  (sql-jdbc.conn/with-connection-spec-for-testing-connection [jdbc-spec [driver details]]
-    (sql-jdbc.execute/do-with-connection-with-options
-     driver
-     jdbc-spec
-     nil
-     (fn [^java.sql.Connection conn]
-       (when (unsupported-version? (.getMetaData conn))
-         (log/warn
-          (u/format-color 'red
-                          (str
-                           "\n\n********************************************************************************\n"
-                           (trs "WARNING: Metabase only officially supports doris {0}/MariaDB {1} and above."
-                                min-supported-doris-version
-                                min-supported-mariadb-version)
-                           "\n"
-                           (trs "All Metabase features may not work properly when using an unsupported version.")
-                           "\n********************************************************************************\n"))))))))
-
-(defmethod driver/can-connect? :doris
-  [driver details]
-  ;; delegate to parent method to check whether we can connect; if so, check if it's an unsupported version and issue
-  ;; a warning if it is
-  (when ((get-method driver/can-connect? :sql-jdbc) driver details)
-    (warn-on-unsupported-versions driver details)
-    true))
 
 (def default-ssl-cert-details
   "Server SSL certificate chain, in PEM format."
@@ -246,13 +191,6 @@
   [:date_format expr (h2x/literal format-str)])
 
 (defn- str-to-date
-  "From the dox:
-
-  > STR_TO_DATE() returns a DATETIME value if the format string contains both date and time parts, or a DATE or TIME
-  > value if the string contains only date or time parts.
-
-  See https://dev.doris.com/doc/refman/8.0/en/date-and-time-functions.html#function_date-format for a list of format
-  specifiers."
   [format-str expr]
   (let [contains-date-parts? (some #(str/includes? format-str %)
                                    ["%a" "%b" "%c" "%D" "%d" "%e" "%j" "%M" "%m" "%U"
@@ -284,8 +222,6 @@
   [:char_length (sql.qp/->honeysql driver arg)])
 
 (def ^:private database-type->doris-cast-type-name
-  "doris supports the ordinary SQL standard database type names for actual type stuff but not for coercions, sometimes.
-  If it doesn't support the ordinary SQL standard type, then we coerce it to a different type that doris does support here"
   {"integer"          "signed"
    "text"             "char"
    "double precision" "double"
@@ -302,16 +238,10 @@
           jsonpath-query        (format "$.%s" (str/join "." (map handle-name (rest nfc-path))))
           json-extract+jsonpath [:json_extract parent-identifier jsonpath-query]]
       (case (u/lower-case-en field-type)
-        ;; If we see JSON datetimes we expect them to be in ISO8601. However, doris expects them as something different.
-        ;; We explicitly tell doris to go and accept ISO8601, because that is JSON datetimes, although there is no real standard for JSON, ISO8601 is the de facto standard.
         "timestamp" [:convert
                      [:str_to_date json-extract+jsonpath "\"%Y-%m-%dT%T.%fZ\""]
                      [:raw "DATETIME"]]
-
         "boolean" json-extract+jsonpath
-
-        ;; in older versions of doris you can't do `convert(<string>, double)` or `cast(<string> AS double)` which is
-        ;; equivalent; instead you can do `<string> + 0.0` =(
         ("float" "double") [:+ json-extract+jsonpath [:inline 0.0]]
 
         [:convert json-extract+jsonpath [:raw (u/upper-case-en field-type)]]))))
@@ -335,11 +265,6 @@
                         %)
                      honeysql-expr))))
 
-;; Since doris doesn't have date_trunc() we fake it by formatting a date to an appropriate string and then converting
-;; back to a date. See http://dev.doris.com/doc/refman/5.6/en/date-and-time-functions.html#function_date-format for an
-;; explanation of format specifiers
-;; this will generate a SQL statement casting the TIME to a DATETIME so date_format doesn't fail:
-;; date_format(CAST(mytime AS DATETIME), '%Y-%m-%d %H') AS mytime
 (defn- trunc-with-format [format-str expr]
   (str-to-date format-str (date-format format-str (h2x/->datetime expr))))
 
@@ -383,8 +308,7 @@
   [driver _unit expr]
   (sql.qp/adjust-day-of-week driver [:dayofweek expr]))
 
-;; To convert a YEARWEEK (e.g. 201530) back to a date you need tell doris which day of the week to use,
-;; because otherwise as far as doris is concerned you could be talking about any of the days in that week
+
 (defmethod sql.qp/date [:doris :week] [_ _ expr]
   (let [extract-week-fn (fn [expr]
                           (str-to-date "%X%V %W"
@@ -399,8 +323,7 @@
                (h2x/concat (date-format "%Y-%m" expr)
                            (h2x/literal "-01"))))
 
-;; Truncating to a quarter is trickier since there aren't any format strings.
-;; See the explanation in the H2 driver, which does the same thing but with slightly different syntax.
+
 (defmethod sql.qp/date [:doris :quarter] [_ _ expr]
   (str-to-date "%Y-%m-%d"
                (h2x/concat (h2x/year expr)
@@ -482,8 +405,6 @@
    :useCompression       true})
 
 (defn- maybe-add-program-name-option [jdbc-spec additional-options-map]
-  ;; connectionAttributes (if multiple) are separated by commas, so values that contain spaces are OK, so long as they
-  ;; don't contain a comma; our mb-version-and-process-identifier shouldn't contain one, but just to be on the safe side
   (let [set-prog-nm-fn (fn []
                          (let [prog-name (str/replace config/mb-version-and-process-identifier "," "_")]
                            (assoc jdbc-spec :connectionAttributes (str "program_name:" prog-name))))]
@@ -510,10 +431,6 @@
     :subname     (make-subname host (or port 3306) db)}
    (dissoc opts :host :port :db)))
 
-(defn- valid-describe-table-row? [{:keys [col_name data_type]}]
-  (every? (every-pred (complement str/blank?)
-                      (complement #(str/starts-with? % "#")))
-          [col_name data_type]))
 
 (defmethod driver/describe-table :doris
   [driver database {table-name :name, schema :schema}]
@@ -532,10 +449,6 @@
 
 (defmethod sql-jdbc.conn/connection-details->spec :doris
   [_ {ssl? :ssl, :keys [additional-options ssl-cert], :as details}]
-  ;; In versions older than 0.32.0 the doris driver did not correctly save `ssl?` connection status. Users worked
-  ;; around this by including `useSSL=true`. Check if that's there, and if it is, assume SSL status. See #9629
-  ;;
-  ;; TODO - should this be fixed by a data migration instead?
   (let [addl-opts-map (sql-jdbc.common/additional-options->map additional-options :url "=" false)
         ssl?          (or ssl? (= "true" (get addl-opts-map "useSSL")))
         ssl-cert?     (and ssl? (some? ssl-cert))]
@@ -574,12 +487,6 @@
   #{"INFORMATION_SCHEMA"})
 
 (defmethod sql.qp/quote-style :doris [_] :mysql)
-
-;; If this fails you need to load the timezone definitions from your system into doris; run the command
-;;
-;;    `doris_tzinfo_to_sql /usr/share/zoneinfo | doris -u root doris`
-;;
-;; See https://dev.doris.com/doc/refman/5.7/en/time-zone-support.html for details
 ;;
 (defmethod sql-jdbc.execute/set-timezone-sql :doris
   [_]
@@ -590,16 +497,6 @@
   ;; convert to a LocalTime so doris doesn't get F U S S Y
   (sql-jdbc.execute/set-parameter driver ps i (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))))
 
-;; Regardless of session timezone it seems to be the case that OffsetDateTimes get normalized to UTC inside doris
-;;
-;; Since doris TIMESTAMPs aren't timezone-aware this means comparisons are done between timestamps in the report
-;; timezone and the local datetime portion of the parameter, in UTC. Bad!
-;;
-;; Convert it to a LocalDateTime, in the report timezone, so comparisions will work correctly.
-;;
-;; See also — https://dev.doris.com/doc/refman/5.5/en/datetime.html
-;;
-;; TIMEZONE FIXME — not 100% sure this behavior makes sense
 (defmethod sql-jdbc.execute/set-parameter [:doris OffsetDateTime]
   [driver ^java.sql.PreparedStatement ps ^Integer i t]
   (let [zone   (t/zone-id (qp.timezone/results-timezone-id))
@@ -620,16 +517,7 @@
     (fn read-datetime-thunk []
       (.getObject rs i LocalDateTime))))
 
-;; Results of `timediff()` might come back as negative values, or might come back as values that aren't valid
-;; `LocalTime`s e.g. `-01:00:00` or `25:00:00`.
-;;
-;; There is currently no way to tell whether the column is the result of a `timediff()` call (i.e., a duration) or a
-;; normal `LocalTime` -- JDBC doesn't have interval/duration type enums. `java.time.LocalTime`only accepts values of
-;; hour between 0 and 23 (inclusive). The MariaDB JDBC driver's implementations of `(.getObject rs i
-;; java.time.LocalTime)` will throw Exceptions theses cases.
-;;
-;; Thus we should attempt to fetch temporal results the normal way and fall back to string representations for cases
-;; where the values are unparseable.
+
 (defmethod sql-jdbc.execute/read-column-thunk [:doris Types/TIME]
   [driver ^ResultSet rs rsmeta ^Integer i]
   (let [parent-thunk ((get-method sql-jdbc.execute/read-column-thunk [:sql-jdbc Types/TIME]) driver rs rsmeta i)]
@@ -639,9 +527,7 @@
         (catch Throwable _
           (.getString rs i))))))
 
-;; doris 8.1+ returns results of YEAR(..) function having a YEAR type. In doris 8.0.33, return value of that function
-;; has an integral type. Let's make the returned values consistent over doris versions.
-;; Context: https://dev.doris.com/doc/connector-j/en/connector-j-YEAR.html
+
 (defmethod sql-jdbc.execute/read-column-thunk [:doris Types/DATE]
   [driver ^ResultSet rs ^ResultSetMetaData rsmeta ^Integer i]
   (if (= "YEAR" (.getColumnTypeName rsmeta i))
@@ -659,8 +545,6 @@
 
 (defmethod unprepare/unprepare-value [:doris OffsetTime]
   [_ t]
-  ;; doris doesn't support timezone offsets in literals so pass in a local time literal wrapped in a call to convert
-  ;; it to the appropriate timezone
   (format "convert_tz('%s', '%s', @@session.time_zone)"
           (t/format "HH:mm:ss.SSS" t)
           (format-offset t)))
@@ -692,7 +576,6 @@
 
 (defmethod driver/table-name-length-limit :doris
   [_driver]
-  ;; https://dev.doris.com/doc/refman/8.0/en/identifier-length.html
   64)
 
 (defn- format-load
@@ -701,13 +584,6 @@
 
 (sql/register-clause! ::load format-load :insert-into)
 
-(defn- offset-datetime->unoffset-datetime
-  "Remove the offset from a datetime, returning a string representation in whatever timezone the `database` is
-  configured to use. This is necessary since MariaDB doesn't support timestamp-with-time-zone literals and so we need
-  to calculate one by hand."
-  [driver database ^OffsetDateTime offset-time]
-  (let [zone-id (t/zone-id (driver/db-default-timezone driver database))]
-    (t/local-date-time offset-time zone-id)))
 
 (defmulti ^:private value->string
   "Convert a value into a string that's safe for insertion"
@@ -732,25 +608,8 @@
   [_driver val]
   (t/format :iso-local-date-time val))
 
-(let [zulu-fmt         "yyyy-MM-dd'T'HH:mm:ss"
-      offset-fmt       "XXX"
-      zulu-formatter   (DateTimeFormatter/ofPattern zulu-fmt)
-      offset-formatter (DateTimeFormatter/ofPattern (str zulu-fmt offset-fmt))]
-  (defmethod value->string OffsetDateTime
-    [driver ^OffsetDateTime val]
-    (let [uploads-db (upload/current-database)]
-      (if (mariadb? uploads-db)
-        (offset-datetime->unoffset-datetime driver uploads-db val)
-        (t/format (if (.equals (.getOffset val) ZoneOffset/UTC)
-                    zulu-formatter
-                    offset-formatter)
-                  val)))))
 
 (defn- sanitize-value
-  ;; Per https://dev.doris.com/doc/refman/8.0/en/load-data.html#load-data-field-line-handling
-  ;; Backslash is the doris escape character within strings in SQL statements. Thus, to specify a literal backslash,
-  ;; you must specify two backslashes for the value to be interpreted as a single backslash. The escape sequences
-  ;; '\t' and '\n' specify tab and newline characters, respectively.
   [v]
   (if (nil? v)
     "\\N"
@@ -778,8 +637,6 @@
 
 (defmethod driver/insert-into! :doris
   [driver db-id ^String table-name column-names values]
-  ;; `local_infile` must be turned on per
-  ;; https://dev.doris.com/doc/refman/8.0/en/load-data.html#load-data-local
   (if (not= (get-global-variable db-id "local_infile") "ON")
     ;; If it isn't turned on, fall back to the generic "INSERT INTO ..." way
     ((get-method driver/insert-into! :sql-jdbc) driver db-id table-name column-names values)
@@ -805,9 +662,6 @@
 
 (defmethod driver/current-user-table-privileges :doris
   [_driver database]
-  ;; MariaDB doesn't allow users to query the privileges of roles a user might have (unless they have select privileges
-  ;; for the mysql database), so we can't query the full privileges of the current user.
-  (when-not (mariadb? database)
     (let [conn-spec   (sql-jdbc.conn/db->pooled-connection-spec database)
           table-names (->> (jdbc/query conn-spec "SHOW TABLES" {:as-arrays? true})
                            (drop 1)
@@ -819,4 +673,4 @@
          :select true
          :update true
          :insert true
-         :delete true}))))
+         :delete true})))
