@@ -1,32 +1,133 @@
 info:
-  name: Metabase Doris Driver
-  version: 0.0.1
-  description: Doris Driver
+  name: Metabase Doris JDBC Driver
+  version: 1.0.0-350-SNAPSHOT
+  description: Allows Metabase to connect to doris databases using the Mysql JDBC driver
 driver:
   name: doris
   display-name: Doris
   lazy-load: true
   parent: sql-jdbc
   connection-properties:
-   - host
-   - merge:
-      - port
-      - default: 9030
-   - name: dbname
-     display-name: Database name
-   - merge:
-      - user
-      - required: true
-        placeholder: "username"
-   - password
-   - ssl
-   - ssh-tunnel
-   - advanced-options-start
-   - merge:
-        - additional-options
-        - placeholder: "trustServerCertificate=false"
-   - default-advanced-options
-
+    - host
+    - merge:
+        - port
+        - default: 9030
+    - merge:
+        - dbname
+        - name: catalog
+          placeholder: internal
+          display-name: Catalog (optional)
+          helper-text: Presto Catalogs contain schemas and reference data sources via a connector.
+          required: false
+          default: internal
+    - name: schema
+      display-name: Schema
+      helper-text: Only add tables to Metabase that come from a specific schema.
+      placeholder: database-name
+      required: true
+    - merge:
+        - user
+        - required: true
+    - merge:
+        - password
+        - required: false
+    - cloud-ip-address-info
+    - ssl
+    - name: ssl-use-keystore
+      display-name: Use SSL server certificate?
+      type: boolean
+      visible-if:
+        ssl: true
+    - name: ssl-keystore
+      display-name: Keystore
+      type: secret
+      secret-kind: keystore
+      placeholder: /path/to/keystore.jks
+      visible-if:
+        ssl-use-keystore: true
+    - name: ssl-keystore-password
+      display-name: Keystore password
+      type: secret
+      secret-kind: password
+      required: false
+      visible-if:
+        ssl-use-keystore: true
+    - name: ssl-use-truststore
+      display-name: Use SSL truststore?
+      type: boolean
+      visible-if:
+        ssl: true
+    - name: ssl-truststore
+      display-name: Truststore
+      type: secret
+      secret-kind: keystore
+      placeholder: /path/to/truststore.jks
+      visible-if:
+        ssl-use-truststore: true
+    - name: ssl-truststore-password
+      display-name: Truststore password
+      type: secret
+      secret-kind: password
+      required: false
+      visible-if:
+        ssl-use-truststore: true
+    - advanced-options-start
+    - name: kerberos
+      type: boolean
+      display-name: Authenticate with Kerberos
+      default: false
+      visible-if:
+        advanced-options: true
+    - name: kerberos-principal
+      display-name: Kerberos principal
+      placeholder: service/instance@REALM
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-remote-service-name
+      display-name: Kerberos coordinator service
+      placeholder: presto
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-use-canonical-hostname
+      type: boolean
+      display-name: Use canonical hostname
+      default: false
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-credential-cache-path
+      display-name: Kerberos credential cache file
+      placeholder: /tmp/kerberos-credential-cache
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-keytab-path
+      display-name: Kerberos keytab file
+      placeholder: /path/to/kerberos.keytab
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-config-path
+      display-name: Kerberos configuration file
+      placeholder: /etc/krb5.conf
+      required: false
+      visible-if:
+        kerberos: true
+    - name: kerberos-service-principal-pattern
+      display-name: Presto coordinator Kerberos service principal pattern
+      placeholder: ${SERVICE}@${HOST}. ${SERVICE}
+      required: false
+      visible-if:
+        kerberos: true
+    - name: additional-options
+      display-name: Additional JDBC options
+      placeholder: SSLKeyStorePath=/path/to/keystore.jks&SSLKeyStorePassword=whatever
+      required: false
+      visible-if:
+        advanced-options: true
+    - default-advanced-options
 init:
   - step: load-namespace
     namespace: metabase.driver.doris
