@@ -1,3 +1,5 @@
+;copied from
+;
 (ns metabase.driver.doris
   "doris driver. Builds off of the SQL-JDBC driver."
   (:require
@@ -12,12 +14,15 @@
    [metabase.config :as config]
    [metabase.db.spec :as mdb.spec]
    [metabase.driver :as driver]
+   [metabase.util.honey-sql-2 :as h2x]
+   [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.models.secret :as secret]
    [metabase.driver.common :as driver.common]
    [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
-   [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.sql-jdbc.sync.describe-table :as sql-jdbc.describe-table]
    [metabase.driver.sql.query-processor.util :as sql.qp.u]
    [metabase.driver.sql.util :as sql.u]
    [metabase.driver.sql.util.unprepare :as unprepare]
@@ -28,7 +33,7 @@
    [metabase.query-processor.util.add-alias-info :as add]
    [metabase.upload :as upload]
    [metabase.util :as u]
-   [metabase.util.honey-sql-2 :as h2x]
+     [metabase.driver.sql-jdbc.execute.legacy-impl :as sql-jdbc.legacy]
    [metabase.util.i18n :refer [deferred-tru trs]]
    [metabase.util.log :as log])
   (:import
@@ -40,39 +45,24 @@
 
 
 
-(driver/register! :doris, :parent :sql-jdbc)
+(driver/register! :doris, :parent #{:sql-jdbc
+                                          ::sql-jdbc.legacy/use-legacy-classes-for-read-and-set})
 
 
 (defmethod driver/display-name :doris [_] "Doris")
 
-(doseq [[feature supported?] {:foreign-keys                           false
-                              :persist-models                         true
-                              :convert-timezone                       false
-                              :datetime-diff                          false
-                              :now                                    true
-                              :regex                                  false
-                              :percentile-aggregations                false
-                              :full-join                              false
-                              :uploads                                false
-                              :schemas                                false
-                              :case-sensitivity-string-filter-options false
-                              :index-info                             false}]
+(doseq [[feature supported?] {:set-timezone                    true
+                              :basic-aggregations              true
+                              :standard-deviation-aggregations true
+                              :expressions                     true
+                              :native-parameters               true
+                              :expression-aggregations         true
+                              :binning                         false
+                              :foreign-keys                    false
+                              :now                             true}]
   (defmethod driver/database-supports? [:doris feature] [_driver _feature _db] supported?))
 
 
-(defmethod driver/database-supports? [:doris :nested-field-columns] [_driver _feat db]
-  (driver.common/json-unfolding-default db))
-
-(doseq [feature [:actions :actions/custom]]
-  (defmethod driver/database-supports? [:doris feature]
-    [driver _feat _db]
-    ;; Only supported for doris right now.
-    (= driver :doris)))
-
-
-(defmethod driver/database-supports? [:doris :table-privileges]
-  [driver _feat db]
-  ( = driver :doris))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             metabase.driver impls                                              |
@@ -138,31 +128,7 @@
 #_{:clj-kondo/ignore [:deprecated-var]}
 (defmethod sql-jdbc.sync/db-default-timezone :doris
   [_ spec]
-  (let [sql                                    (str "SELECT @@GLOBAL.time_zone AS global_tz,"
-                                                    " @@system_time_zone AS system_tz,"
-                                                    " time_format("
-                                                    "   timediff("
-                                                    "      now(), convert_tz(now(), @@GLOBAL.time_zone, '+00:00')"
-                                                    "   ),"
-                                                    "   '%H:%i'"
-                                                    " ) AS 'offset';")
-        [{:keys [global_tz system_tz offset]}] (jdbc/query spec sql)
-        the-valid-id                           (fn [zone-id]
-                                                 (when zone-id
-                                                   (try
-                                                     (.getId (t/zone-id zone-id))
-                                                     (catch Throwable _))))]
-    (or
-     ;; if global timezone ID is 'SYSTEM', then try to use the system timezone ID
-     (when (= global_tz "SYSTEM")
-       (the-valid-id system_tz))
-     ;; otherwise try to use the global ID
-     (the-valid-id global_tz)
-     ;; failing that, calculate the offset between now in the global timezone and now in UTC. Non-negative offsets
-     ;; don't come back with `+` so add that if needed
-     (if (str/starts-with? offset "-")
-       offset
-       (str \+ offset)))))
+  "UTC")
 
 (defmethod driver/db-start-of-week :doris
   [_]
@@ -361,29 +327,67 @@
 ;;; |                                         metabase.driver.sql-jdbc impls                                         |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defmethod sql-jdbc.sync/database-type->base-type :doris
-  [_ database-type]
-  (condp re-matches (u/lower-case-en (name database-type))
-    #"boolean"          :type/Boolean
-    #"tinyint"          :type/Integer
-    #"smallint"         :type/Integer
-    #"int"              :type/Integer
-    #"bigint"           :type/BigInteger
-    #"float"            :type/Float
-    #"double"           :type/Float
-    #"double precision" :type/Double
-    #"decimal.*"        :type/Decimal
-    #"char.*"           :type/Text
-    #"varchar.*"        :type/Text
-    #"string.*"         :type/Text
-    #"binary*"          :type/*
-    #"date"             :type/Date
-    #"time"             :type/Time
-    #"timestamp"        :type/DateTime
-    #"interval"         :type/*
-    #"array.*"          :type/Array
-    #"map"              :type/Dictionary
-    #".*"               :type/*))
+
+(def ^:private ^{:arglists '([column-type])} presto-type->base-type
+  "Function that returns a `base-type` for the given `presto-type` (can be a keyword or string)."
+  (sql-jdbc.sync/pattern-based-database-type->base-type
+   [
+    [#"(?i)BIGINT"     :type/BigInteger]
+    [#"(?i)BINARY"     :type/*]
+    [#"(?i)BIT"        :type/Boolean]
+    [#"(?i)BLOB"       :type/*]
+    [#"(?i)CHAR"       :type/Text]
+    [#"(?i)DATE"       :type/Date]
+    [#"(?i)DATETIME"   :type/DateTime]
+    [#"(?i)DECIMAL"    :type/Decimal]
+    [#"(?i)DOUBLE"     :type/Float]
+    [#"(?i)ENUM"       :type/*]
+    [#"(?i)FLOAT"      :type/Float]
+    [#"(?i)INT"        :type/Integer]
+    [#"(?i)INTEGER"    :type/Integer]
+    [#"(?i)LONGBLOB"   :type/*]
+    [#"(?i)LONGTEXT"   :type/Text]
+    [#"(?i)MEDIUMBLOB" :type/*]
+    [#"(?i)MEDIUMINT"  :type/Integer]
+    [#"(?i)MEDIUMTEXT" :type/Text]
+    [#"(?i)NUMERIC.*"    :type/Decimal]
+    [#"(?i)REAL"       :type/Float]
+    [#"(?i)SET"        :type/*]
+    [#"(?i)SMALLINT"   :type/Integer]
+    [#"(?i)TEXT"       :type/Text]
+    [#"(?i)TIME"       :type/Time]
+    [#"(?i)TIMESTAMP"  :type/DateTimeWithLocalTZ] ; stored as UTC in the database
+    [#"(?i)TINYBLOB"   :type/*]
+    [#"(?i)TINYINT"    :type/Integer]
+    [#"(?i)TINYTEXT"   :type/Text]
+    [#"(?i)VARBINARY"  :type/*]
+    [#"(?i)VARCHAR.*"    :type/Text]
+    [#"(?i)YEAR"       :type/Integer]
+    [#"(?i)JSON"       :type/JSON]
+    [#"(?i)BOOLEAN"                    :type/Boolean]
+    [#"(?i)tinyint"                    :type/Integer]
+    [#"(?i)smallint"                   :type/Integer]
+    [#"(?i)integer"                    :type/Integer]
+    [#"(?i)bigint"                     :type/BigInteger]
+    [#"(?i)real"                       :type/Float]
+    [#"(?i)double"                     :type/Float]
+    [#"(?i)decimal.*"                  :type/Decimal]
+    [#"(?i)varchar.*"                  :type/Text]
+    [#"(?i)char.*"                     :type/Text]
+    [#"(?i)varbinary.*"                :type/*]
+    [#"(?i)json"                       :type/Text] ; TODO - this should probably be Dictionary or something
+    [#"(?i)date"                       :type/Date]
+    [#"(?i)^timestamp$"                :type/DateTime]
+    [#"(?i)^timestamp with time zone$" :type/DateTimeWithTZ]
+    [#"(?i)^time$"                     :type/Time]
+    [#"(?i)^time with time zone$"      :type/TimeWithTZ]
+    [#"(?i)array"                      :type/Array]
+    [#"(?i)map"                        :type/Dictionary]
+    [#"(?i)row.*"                      :type/*] ; TODO - again, but this time we supposedly have a schema
+    [#".*"                             :type/*]]))
+
+(defmethod sql-jdbc.sync/database-type->base-type :doris [_driver database-type]
+  (presto-type->base-type database-type))
 
 
 (defmethod sql-jdbc.sync/column->semantic-type :doris
@@ -414,80 +418,147 @@
         (set-prog-nm-fn))
       (set-prog-nm-fn)))) ; additional-options did not contain connectionAttributes at all; set it
 
-(defn make-subname
-  "Make a subname for the given `host`, `port`, and `db` params.  Iff `db` is not blank, then a slash will
-  precede it in the subname."
-  {:arglists '([host port db]), :added "0.39.0"}
-  [host port db]
-  (str "//" (when-not (str/blank? host) (str host ":" port)) (if-not (str/blank? db) (str "/" db) "/")))
-
-(defmethod mdb.spec/spec :doris
-  [_ {:keys [host port db]
-      :or   {host "localhost", port 3306, db ""}
-      :as   opts}]
-  (merge
-   {:classname   "com.mysql.cj.jdbc.Driver"
-    :subprotocol "mysql"
-    :subname     (make-subname host (or port 3306) db)}
-   (dissoc opts :host :port :db)))
 
 
-(defmethod driver/describe-table :doris
-  [driver database {table-name :name, schema :schema}]
-  {:name   table-name
-   :schema schema
-   :fields
-   (with-open [conn (jdbc/get-connection (sql-jdbc.conn/db->pooled-connection-spec database))]
-     (let [results (jdbc/query {:connection conn} [(format
-                                                    "describe %s" table-name)])]
-       (set
-        (for [[idx result] (m/indexed results)]
-          {:name              (get result :field)
-           :database-type     (get result :type)
-           :base-type        (sql-jdbc.sync/database-type->base-type driver (keyword (get result :type)))
-           :database-position idx}))))})
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                  Connectivity                                                  |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;;; Kerberos related definitions
+(def ^:private kerb-props->url-param-names
+  {:kerberos-principal "KerberosPrincipal"
+   :kerberos-remote-service-name "KerberosRemoteServiceName"
+   :kerberos-use-canonical-hostname "KerberosUseCanonicalHostname"
+   :kerberos-credential-cache-path "KerberosCredentialCachePath"
+   :kerberos-keytab-path "KerberosKeytabPath"
+   :kerberos-service-principal-pattern "KerberosServicePrincipalPattern"
+   :kerberos-config-path "KerberosConfigPath"})
+
+(defn- details->kerberos-url-params [details]
+  (let [remove-blank-vals (fn [m] (into {} (remove (comp str/blank? val) m)))
+        ks                (keys kerb-props->url-param-names)]
+    (-> (select-keys details ks)
+      remove-blank-vals
+      (set/rename-keys kerb-props->url-param-names))))
+
+(defn- append-additional-options [additional-options props]
+  (let [opts-str (sql-jdbc.common/additional-opts->string :url props)]
+    (if (str/blank? additional-options)
+      opts-str
+      (str additional-options "&" opts-str))))
+
+(defn- prepare-addl-opts [{:keys [SSL kerberos] :as details}]
+  (let [det (if kerberos
+              (if-not SSL
+                (throw (ex-info (trs "SSL must be enabled to use Kerberos authentication")
+                                {:db-details details}))
+                ;; convert Kerberos options map to URL string
+                (update details
+                        :additional-options
+                        append-additional-options
+                        (details->kerberos-url-params details)))
+              details)]
+    ;; in any case, remove the standalone Kerberos properties from details map
+    (apply dissoc (cons det (keys kerb-props->url-param-names)))))
+
+(defn- db-name
+  "Creates a \"DB name\" for the given catalog `c` and (optional) schema `s`.  If both are specified, a slash is
+  used to separate them.  See examples at:
+  https://prestodb.io/docs/current/installation/jdbc.html#connecting"
+  [c s]
+  (cond
+    (str/blank? c)
+    ""
+
+    (str/blank? s)
+    c
+
+    :else
+    (str c "." s)))
+
+(defn- jdbc-spec
+  "Creates a spec for `clojure.java.jdbc` to use for connecting to Presto via JDBC, from the given `opts`."
+  [{:keys [host port catalog schema]
+    :or   {host "localhost", port 5432, catalog ""}
+    :as   details}]
+  (-> details
+      (merge {:classname   "com.mysql.cj.jdbc.Driver"
+              :subprotocol "mysql"
+              :subname     (mdb.spec/make-subname host port (db-name catalog schema))})
+      prepare-addl-opts
+      (dissoc :host :port :db :catalog :schema :tunnel-enabled :engine :kerberos)
+      sql-jdbc.common/handle-additional-options))
+
+(defn- str->bool [v]
+  (if (string? v)
+    (Boolean/parseBoolean v)
+    v))
+
+(defn- get-valid-secret-file [details-map property-name]
+  (let [secret-map (secret/db-details-prop->secret-map details-map property-name)]
+    (when-not (:value secret-map)
+      (throw (ex-info (format "Property %s should be defined" property-name)
+                      {:connection-details details-map
+                       :propery-name property-name})))
+    (.getCanonicalPath (secret/value->file! secret-map :doris))))
+
+(defn- maybe-add-ssl-stores [details-map]
+  (let [props
+        (cond-> {}
+          (str->bool (:ssl-use-keystore details-map))
+          (assoc :SSLKeyStorePath (get-valid-secret-file details-map "ssl-keystore")
+                 :SSLKeyStorePassword (secret/value->string
+                                       (secret/db-details-prop->secret-map details-map "ssl-keystore-password")))
+          (str->bool (:ssl-use-truststore details-map))
+          (assoc :SSLTrustStorePath (get-valid-secret-file details-map "ssl-truststore")
+                 :SSLTrustStorePassword (secret/value->string
+                                         (secret/db-details-prop->secret-map details-map "ssl-truststore-password"))))]
+    (cond-> details-map
+      (seq props)
+      (update :additional-options append-additional-options props))))
+
 
 (defmethod sql-jdbc.conn/connection-details->spec :doris
-  [_ {ssl? :ssl, :keys [additional-options ssl-cert], :as details}]
-  (let [addl-opts-map (sql-jdbc.common/additional-options->map additional-options :url "=" false)
-        ssl?          (or ssl? (= "true" (get addl-opts-map "useSSL")))
-        ssl-cert?     (and ssl? (some? ssl-cert))]
-    (when (and ssl? (not (contains? addl-opts-map "trustServerCertificate")))
-      (log/info (trs "You may need to add 'trustServerCertificate=true' to the additional connection options to connect with SSL.")))
-    (merge
-     default-connection-args
-     ;; newer versions of doris will complain if you don't specify this when not using SSL
-     {:useSSL (boolean ssl?)}
-     (let [details (-> (if ssl-cert? (set/rename-keys details {:ssl-cert :serverSslCert}) details)
-                       (set/rename-keys {:dbname :db})
-                       (dissoc :ssl))]
-       (-> (mdb.spec/spec :doris details)
-           (maybe-add-program-name-option addl-opts-map)
-           (sql-jdbc.common/handle-additional-options details))))))
-
-
-(defmethod driver/describe-database :doris
-  [driver database]
-  {:tables
-   (sql-jdbc.execute/do-with-connection-with-options
-    driver
-    database
-    nil
-    (fn [^Connection conn]
-      (set
-       (for [_map (jdbc/query {:connection conn} ["show tables"])]
-         {:name   (first (vals _map)) ; column name differs depending on server (SparkSQL, hive, Impala)
-          :schema  (get-in database [:details :dbname])}))))})
+  [_ details-map]
+  (let [props (-> details-map
+                  (update :port (fn [port]
+                                  (if (string? port)
+                                    (Integer/parseInt port)
+                                    port)))
+                  (update :ssl str->bool)
+                  (update :kerberos str->bool)
+                  (assoc :SSL (:ssl details-map))
+                  maybe-add-ssl-stores
+                  ;; remove any Metabase specific properties that are not recognized by the PrestoDB JDBC driver, which is
+                  ;; very picky about properties (throwing an error if any are unrecognized)
+                  ;; all valid properties can be found in the JDBC Driver source here:
+                  ;; https://github.com/prestodb/presto/blob/master/tri/src/main/java/com/facebook/presto/jdbc/ConnectionProperties.java
+                  (select-keys (concat
+                                [:host :port :catalog :schema :additional-options ; needed for `jdbc-spec`
+                                 ;; JDBC driver specific properties
+                                 :kerberos ; we need our boolean property indicating if Kerberos is enabled
+                                           ; but the rest of them come from `kerb-props->url-param-names` (below)
+                                 :user :password :socksProxy :httpProxy :applicationNamePrefix :disableCompression :SSL
+                                 ;; Passing :SSLKeyStorePath :SSLKeyStorePassword :SSLTrustStorePath :SSLTrustStorePassword
+                                 ;; in the properties map doesn't seem to work, they are included as additional options.
+                                 :accessToken :extraCredentials :sessionProperties :protocols :queryInterceptors]
+                                (keys kerb-props->url-param-names))))]
+    (jdbc-spec props)))
 
 
 
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                  Connectivity  - End                                           |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defmethod sql-jdbc.sync/excluded-schemas :doris
   [_]
   #{"INFORMATION_SCHEMA"})
 
-(defmethod sql.qp/quote-style :doris [_] :mysql)
-;;
+
 (defmethod sql-jdbc.execute/set-timezone-sql :doris
   [_]
   "SET @@session.time_zone = %s;")
@@ -674,3 +745,115 @@
          :update true
          :insert true
          :delete true})))
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                           Sync  Method Impls                                            |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn- describe-catalog-sql
+  "The SHOW SCHEMAS statement that will list all schemas for the given `catalog`."
+  {:added "0.39.0"}
+  [driver catalog]
+  (str "SHOW SCHEMAS FROM " (sql.u/quote-name driver :database catalog)))
+
+(defn- describe-schema-sql
+  "The SHOW TABLES statement that will list all tables for the given `catalog` and `schema`."
+  {:added "0.39.0"}
+  [driver catalog schema]
+  (str "SHOW TABLES FROM " (sql.u/quote-name driver :schema catalog schema)))
+
+(defn- describe-table-sql
+  "The DESCRIBE  statement that will list information about the given `table`, in the given `catalog` and schema`."
+  {:added "0.39.0"}
+  [driver catalog schema table]
+  (str "DESCRIBE " (sql.u/quote-name driver :table catalog schema table)))
+
+(defn- have-select-privilege?
+  "Checks whether the connected user has permission to select from the given `table-name`, in the given `schema`.
+  Adapted from the legacy Presto driver implementation."
+  [driver conn schema table-name]
+  true)
+
+(defn- describe-schema
+  "Gets a set of maps for all tables in the given `catalog` and `schema`. Adapted from the legacy Presto driver
+  implementation."
+  [driver conn catalog schema]
+  (let [sql (describe-schema-sql driver catalog schema)]
+    (log/info (trs "Running statement in describe-schema: {0}" sql))
+    (into #{} (comp (filter (fn [{table-name :table}]
+                                (have-select-privilege? driver conn schema table-name)))
+                    (map (fn [{table-name :table}]
+                             {:name        table-name
+                              :schema      schema})))
+              (jdbc/reducible-query {:connection conn} sql))))
+
+(def ^:private excluded-schemas
+  "The set of schemas that should be excluded when querying all schemas."
+  #{"information_schema"})
+
+
+(defn- all-schemas
+  "Gets a set of maps for all tables in all schemas in the given `catalog`. Adapted from the legacy Presto driver
+  implementation."
+  [driver conn catalog]
+  (let [sql (describe-catalog-sql driver catalog)]
+    (log/trace (trs "Running statement in all-schemas: {0}" sql))
+    (into []
+          (map (fn [{:keys [schema]}]
+                 (when-not (contains? excluded-schemas schema)
+                   (describe-schema driver conn catalog schema))))
+          (jdbc/reducible-query {:connection conn} sql))))
+
+
+(defmethod driver/describe-database :doris
+   [driver {{:keys [catalog schema] :as _details} :details :as database}]
+  {:tables
+   (sql-jdbc.execute/do-with-connection-with-options
+    driver
+    database
+    nil
+    (fn [^Connection conn]
+      (set
+       (for [_map (jdbc/query {:connection conn} [(describe-schema-sql driver catalog schema)])]
+         {:name   (first (vals _map)) ; column name differs depending on server (SparkSQL, hive, Impala)
+          :schema  (get-in database [:details :dbname])}))))})
+
+
+(defmethod driver/describe-table :doris
+ [driver {{:keys [catalog schema] :as _details} :details :as database} {table-name :name}]
+  {:name   table-name
+   :schema schema
+   :fields
+   (with-open [conn (jdbc/get-connection (sql-jdbc.conn/db->pooled-connection-spec database))]
+     (let [results (jdbc/query {:connection conn} [(describe-table-sql driver catalog schema table-name)])]
+       (set
+        (for [[idx result] (m/indexed results)]
+          {:name              (get result :field)
+           :database-type     (get result :type)
+           :base-type        (sql-jdbc.sync/database-type->base-type driver (keyword (get result :type)))
+           :database-position idx}))))})
+
+
+
+(defmethod sql-jdbc.describe-table/get-table-pks :doris
+  [_driver ^Connection conn db-name-or-nil table]
+  nil)
+
+
+;;; The Presto JDBC driver DOES NOT support the `.getImportedKeys` method so just return `nil` here so the `:sql-jdbc`
+;;; implementation doesn't try to use it.
+(defmethod driver/describe-table-fks :doris
+  [_driver _database _table]
+  nil)
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                           Other Driver Method Impls                                            |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(prefer-method driver/database-supports? [:doris :set-timezone] [:sql-jdbc :set-timezone])
+
+(defmethod sql.qp/quote-style :doris [_driver]
+  :mysql)
+
+
