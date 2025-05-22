@@ -1,25 +1,26 @@
 info:
   name: Metabase Doris JDBC Driver
-  version: 1.0.0-350-SNAPSHOT
+  version: 2.1.0-SNAPSHOT
   description: Allows Metabase to connect to doris databases using the Mysql JDBC driver
 driver:
   name: doris
-  display-name: Doris
+  display-name: Doris-alpha
   lazy-load: true
   parent: sql-jdbc
   connection-properties:
-    - host
+    - merge:
+      - host
+      - required: true
     - merge:
         - port
-        - default: 9030
+        - placeholder: 9030
     - merge:
         - dbname
         - name: catalog
           placeholder: internal
           display-name: Catalog (optional)
-          helper-text: Presto Catalogs contain schemas and reference data sources via a connector.
+          helper-text: Doris Catalogs contain schemas and reference data sources via a connector.
           required: false
-          default: internal
     - name: schema
       display-name: Schema
       helper-text: Only add tables to Metabase that come from a specific schema.
