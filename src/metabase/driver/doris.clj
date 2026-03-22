@@ -464,7 +464,7 @@
 (defn- jdbc-spec
   "Creates a spec for `clojure.java.jdbc` to use for connecting to doris via JDBC, from the given `opts`."
   [{:keys [host port catalog schema]
-    :or   {host "localhost", port 5432, catalog "default", schema "default"}
+    :or   {host "localhost", port 9030, catalog "default", schema "default"}
     :as   details}]
 
   (-> details
@@ -526,7 +526,10 @@
                                  ;; in the properties map doesn't seem to work, they are included as additional options.
                                  :accessToken :extraCredentials :sessionProperties :protocols :queryInterceptors]
                                 (keys kerb-props->url-param-names))))]
-    (jdbc-spec props)))
+    (-> props
+        (merge default-connection-args)
+        (jdbc-spec)
+        (maybe-add-program-name-option (sql-jdbc.common/additional-opts->map (:additional-options props))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                  Connectivity  - End                                           |
@@ -772,7 +775,7 @@
     (log/trace (trs "Running statement in all-schemas: {0}" sql))
     (into []
           (map (fn [{:keys [schema]}]
-                 (when-not (contains? excluded-schemas schema)
+                 (when-not (contains? excluded-schemas (u/lower-case-en schema))
                    (describe-schema driver conn catalog schema))))
           (jdbc/reducible-query {:connection conn} sql))))
 
