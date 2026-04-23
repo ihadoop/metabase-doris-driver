@@ -227,6 +227,30 @@
                         %)
                      honeysql-expr))))
 
+(defmethod sql.qp/->honeysql [:doris :contains]
+  [driver [_ field value {:keys [case-sensitive] :or {case-sensitive true}}]]
+  (let [field-expr (sql.qp/->honeysql driver field)
+        value-expr (sql.qp/->honeysql driver value)]
+    (if case-sensitive
+      [:like field-expr (h2x/concat (h2x/literal "%") value-expr (h2x/literal "%"))]
+      [:like [:lower field-expr] (h2x/concat (h2x/literal "%") [:lower value-expr] (h2x/literal "%"))])))
+
+(defmethod sql.qp/->honeysql [:doris :starts-with]
+  [driver [_ field value {:keys [case-sensitive] :or {case-sensitive true}}]]
+  (let [field-expr (sql.qp/->honeysql driver field)
+        value-expr (sql.qp/->honeysql driver value)]
+    (if case-sensitive
+      [:like field-expr (h2x/concat value-expr (h2x/literal "%"))]
+      [:like [:lower field-expr] (h2x/concat [:lower value-expr] (h2x/literal "%"))])))
+
+(defmethod sql.qp/->honeysql [:doris :ends-with]
+  [driver [_ field value {:keys [case-sensitive] :or {case-sensitive true}}]]
+  (let [field-expr (sql.qp/->honeysql driver field)
+        value-expr (sql.qp/->honeysql driver value)]
+    (if case-sensitive
+      [:like field-expr (h2x/concat (h2x/literal "%") value-expr)]
+      [:like [:lower field-expr] (h2x/concat (h2x/literal "%") [:lower value-expr])])))
+
 (defn- trunc-with-format [format-str expr]
   (str-to-date format-str (date-format format-str (h2x/->datetime expr))))
 
@@ -395,15 +419,15 @@
    ;; GZIP compress packets sent between Metabase server and doris/MariaDB database
    :useCompression       true})
 
-(defn- maybe-add-program-name-option [jdbc-spec additional-options-map]
-  (let [set-prog-nm-fn (fn []
-                         (let [prog-name (str/replace config/mb-version-and-process-identifier "," "_")]
-                           (assoc jdbc-spec :connectionAttributes (str "program_name:" prog-name))))]
-    (if-let [conn-attrs (get additional-options-map "connectionAttributes")]
-      (if (str/includes? conn-attrs "program_name")
-        jdbc-spec ; additional-options already includes the program_name; don't set it here
-        (set-prog-nm-fn))
-      (set-prog-nm-fn)))) ; additional-options did not contain connectionAttributes at all; set it
+;; (defn- maybe-add-program-name-option [jdbc-spec additional-options-map]
+;;   (let [set-prog-nm-fn (fn []
+;;                          (let [prog-name (str/replace config/mb-version-and-process-identifier "," "_")]
+;;                            (assoc jdbc-spec :connectionAttributes (str "program_name:" prog-name))))]
+;;     (if-let [conn-attrs (get additional-options-map "connectionAttributes")]
+;;       (if (str/includes? conn-attrs "program_name")
+;;         jdbc-spec ; additional-options already includes the program_name; don't set it here
+;;         (set-prog-nm-fn))
+;;       (set-prog-nm-fn)))) ; additional-options did not contain connectionAttributes at all; set it
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                  Connectivity                                                  |
@@ -464,7 +488,7 @@
 (defn- jdbc-spec
   "Creates a spec for `clojure.java.jdbc` to use for connecting to doris via JDBC, from the given `opts`."
   [{:keys [host port catalog schema]
-    :or   {host "localhost", port 5432, catalog "default", schema "default"}
+    :or   {host "localhost", port 9030, catalog "default", schema "default"}
     :as   details}]
 
   (-> details
@@ -526,7 +550,10 @@
                                  ;; in the properties map doesn't seem to work, they are included as additional options.
                                  :accessToken :extraCredentials :sessionProperties :protocols :queryInterceptors]
                                 (keys kerb-props->url-param-names))))]
-    (jdbc-spec props)))
+    (-> props
+        (merge default-connection-args)
+        (jdbc-spec))))
+        ;; (maybe-add-program-name-option (sql-jdbc.common/additional-opts->map (:additional-options props))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                                  Connectivity  - End                                           |
@@ -772,7 +799,7 @@
     (log/trace (trs "Running statement in all-schemas: {0}" sql))
     (into []
           (map (fn [{:keys [schema]}]
-                 (when-not (contains? excluded-schemas schema)
+                 (when-not (contains? excluded-schemas (u/lower-case-en schema))
                    (describe-schema driver conn catalog schema))))
           (jdbc/reducible-query {:connection conn} sql))))
 
